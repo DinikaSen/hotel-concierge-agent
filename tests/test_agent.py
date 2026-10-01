@@ -394,3 +394,72 @@ class TestAgentIDAuthRefreshesToken:
         client, seen = self._client(auth, [200])
         await client.post("https://gw/mcp")
         assert seen == ["Bearer t1"]
+
+
+class TestGetAgentRetriesFailedMcpDiscovery:
+    """If MCP discovery fails once (proxy/upstream briefly down), the agent
+    must not cache a tool-less build forever — that left an agent without
+    room tools until its pod was restarted."""
+
+    @pytest.fixture
+    def agent_module(self, monkeypatch: pytest.MonkeyPatch):
+        import agent as agent_module
+
+        monkeypatch.setattr(agent_module, "_agent", None)
+        monkeypatch.setattr(agent_module, "_degraded_agent", None)
+        monkeypatch.setattr(agent_module, "_mcp_retry_at", 0.0)
+        monkeypatch.setattr(agent_module, "ChatOpenAI", lambda **kw: object())
+        monkeypatch.setattr(
+            agent_module, "create_react_agent", lambda llm, tools, prompt: [t.name for t in tools]
+        )
+        monkeypatch.setenv("HOTEL_TOOLS_URL", "https://gw/mcp")
+        return agent_module
+
+    @staticmethod
+    def _discovery(monkeypatch, agent_module, results: list[list]) -> list[int]:
+        calls: list[int] = []
+
+        async def fake_get_mcp_tools():
+            calls.append(1)
+            return results[len(calls) - 1]
+
+        monkeypatch.setattr(agent_module, "_get_mcp_tools", fake_get_mcp_tools)
+        return calls
+
+    @staticmethod
+    def _mcp_tool():
+        from langchain_core.tools import tool
+
+        @tool
+        def check_room_availability(room_type: str) -> str:
+            """stub"""
+            return room_type
+
+        return check_room_availability
+
+    @pytest.mark.anyio
+    async def test_failed_discovery_is_retried_after_backoff(self, monkeypatch, agent_module) -> None:
+        calls = self._discovery(monkeypatch, agent_module, [[], [self._mcp_tool()]])
+
+        first = await agent_module._get_agent()
+        assert "check_room_availability" not in first
+        # within the backoff window: served the degraded agent, no new discovery
+        assert await agent_module._get_agent() is first
+        assert len(calls) == 1
+
+        monkeypatch.setattr(agent_module, "_mcp_retry_at", 0.0)  # backoff elapsed
+        recovered = await agent_module._get_agent()
+        assert "check_room_availability" in recovered
+        assert len(calls) == 2
+        # now cached for good
+        assert await agent_module._get_agent() is recovered
+        assert len(calls) == 2
+
+    @pytest.mark.anyio
+    async def test_no_mcp_configured_caches_immediately(self, monkeypatch, agent_module) -> None:
+        monkeypatch.delenv("HOTEL_TOOLS_URL")
+        calls = self._discovery(monkeypatch, agent_module, [[], []])
+        first = await agent_module._get_agent()
+        monkeypatch.setattr(agent_module, "_mcp_retry_at", 0.0)
+        assert await agent_module._get_agent() is first
+        assert len(calls) == 1

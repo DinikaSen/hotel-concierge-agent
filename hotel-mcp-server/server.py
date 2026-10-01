@@ -28,7 +28,13 @@ from hotel_data import ROOMS
 # rather than hardcoded, since the same image runs behind whichever gateway
 # domain the deploying instance uses (AWS's public sslip.io domain here;
 # a local instance's .localhost domain if ever redeployed there).
-PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "localhost")
+#
+# Comma-separated, because callers don't agree on the Host they send: e.g.
+# Agent Manager's registration probe sends "host:port" while the gateway
+# forwarding real traffic sends the bare "host".
+PUBLIC_HOSTS = [
+    h.strip() for h in os.environ.get("PUBLIC_HOST", "localhost").split(",") if h.strip()
+]
 PUBLIC_SCHEME = os.environ.get("PUBLIC_SCHEME", "https")
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -119,8 +125,8 @@ if __name__ == "__main__":
         host="0.0.0.0",
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=[PUBLIC_HOST, "localhost", f"localhost:{port}", f"127.0.0.1:{port}"],
-            allowed_origins=[f"{PUBLIC_SCHEME}://{PUBLIC_HOST}"],
+            allowed_hosts=[*PUBLIC_HOSTS, "localhost", f"localhost:{port}", f"127.0.0.1:{port}"],
+            allowed_origins=[f"{PUBLIC_SCHEME}://{h}" for h in PUBLIC_HOSTS],
         ),
     )
     uvicorn.run(app, host="0.0.0.0", port=port)

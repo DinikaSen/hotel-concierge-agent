@@ -68,6 +68,10 @@ SESSION_LOCKS: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
 _agent = None
 _agent_lock = asyncio.Lock()
+# Tool-less agent served while MCP discovery is failing, and when to retry.
+_degraded_agent = None
+_mcp_retry_at = 0.0
+MCP_DISCOVERY_RETRY_S = 30
 
 # Env var name for the hotel-tools MCP proxy's URL, injected by Agent Manager
 # once the Tool Configuration is attached (see docs/guides/configure-agent-mcp-proxies).
@@ -262,21 +266,37 @@ async def _get_agent():
     """Lazy + cached so the module imports cleanly with no keys set (CI,
     linters, /health smoke tests), and so MCP tool discovery (a network call)
     happens once rather than per-request. ChatOpenAI reads credentials on
-    first instantiation, not at import time."""
-    global _agent
+    first instantiation, not at import time.
+
+    If the MCP proxy is configured but discovery fails (proxy or upstream
+    down, a misconfigured upstream), the tool-less agent is served but NOT
+    cached as final — discovery is retried at most every
+    MCP_DISCOVERY_RETRY_S, so the agent recovers once the proxy does instead
+    of running without room tools until the pod restarts."""
+    global _agent, _degraded_agent, _mcp_retry_at
     if _agent is not None:
         return _agent
     async with _agent_lock:
-        if _agent is None:  # re-check: another request may have won the race
-            cfg = _resolve_llm_config()
-            if (client := _debug_http_client()) is not None:
-                cfg["http_client"] = client
-            llm = ChatOpenAI(model=OPENAI_MODEL, **cfg)
-            mcp_tools = await _get_mcp_tools()
-            all_tools = _LOCAL_TOOLS + mcp_tools
-            log.info("agent tools loaded: %s", [t.name for t in all_tools])
-            _agent = create_react_agent(llm, tools=all_tools, prompt=SYSTEM_PROMPT)
-    return _agent
+        if _agent is not None:  # re-check: another request may have won the race
+            return _agent
+        if _degraded_agent is not None and time.monotonic() < _mcp_retry_at:
+            return _degraded_agent
+        cfg = _resolve_llm_config()
+        if (client := _debug_http_client()) is not None:
+            cfg["http_client"] = client
+        llm = ChatOpenAI(model=OPENAI_MODEL, **cfg)
+        mcp_tools = await _get_mcp_tools()
+        all_tools = _LOCAL_TOOLS + mcp_tools
+        log.info("agent tools loaded: %s", [t.name for t in all_tools])
+        agent = create_react_agent(llm, tools=all_tools, prompt=SYSTEM_PROMPT)
+        if mcp_tools or not os.environ.get(HOTEL_TOOLS_MCP_URL_VAR, "").strip():
+            _agent = agent
+            _degraded_agent = None
+        else:
+            log.warning("MCP tools unavailable; retrying discovery in %ss", MCP_DISCOVERY_RETRY_S)
+            _degraded_agent = agent
+            _mcp_retry_at = time.monotonic() + MCP_DISCOVERY_RETRY_S
+        return agent
 
 
 def _ready_payload() -> dict[str, Any]:
